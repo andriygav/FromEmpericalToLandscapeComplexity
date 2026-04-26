@@ -1,0 +1,7 @@
+{
+  "status": "finished",
+  "output_csv": "/workspace/NEWARTICLE/FromEmpericalToLandscapeComplexity/artifacts/results_grid.csv",
+  "checkpoints_dir": "/workspace/NEWARTICLE/FromEmpericalToLandscapeComplexity/artifacts/checkpoints",
+  "done_runs": 96,
+  "pending_runs": 0
+}
