@@ -213,7 +213,7 @@ def main() -> None:
     args = parser.parse_args()
 
     dataset_name = "wikitext"
-    dataset_config = "wikitext-2-raw-v1"
+    dataset_config = "wikitext-103-raw-v1"
     tokenizer_name = "gpt2"
     resume = True
     device = torch.device(args.device)
