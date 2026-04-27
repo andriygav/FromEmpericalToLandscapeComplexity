@@ -212,7 +212,13 @@ def load_real_token_streams(
 
 def _hvp_per_example(model: TinyGPT, x_i: torch.Tensor, y_i: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     params = [p for p in model.parameters() if p.requires_grad]
-    loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
+    # HVP needs second-order gradients; force SDPA math backend to avoid
+    # unsupported double-backward paths in efficient CUDA kernels.
+    if x_i.is_cuda:
+        with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+            loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
+    else:
+        loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
     g = torch.autograd.grad(loss_i, params, create_graph=True)
     g_flat = torch.cat([t.reshape(-1) for t in g])
     gv = torch.dot(g_flat, v)

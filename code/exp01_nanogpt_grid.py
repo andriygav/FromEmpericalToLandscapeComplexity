@@ -126,15 +126,15 @@ def train_one(
     tokens_per_step = cfg.block_size * cfg.batch_size
     max_steps = max(1, int(np.ceil(cfg.train_tokens / tokens_per_step)))
     amp_enabled = use_amp and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
-    autocast_ctx = torch.cuda.amp.autocast if amp_enabled else nullcontext
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    autocast_ctx = torch.amp.autocast if amp_enabled else nullcontext
 
     print(f"[{run_idx}/{total_runs}] {cfg.run_name}: training {max_steps} steps on {device}", flush=True)
     model.train()
     for step in range(1, max_steps + 1):
         xb, yb = next(train_iter)
         optim.zero_grad(set_to_none=True)
-        with autocast_ctx(dtype=torch.float16) if amp_enabled else autocast_ctx():
+        with autocast_ctx("cuda", dtype=torch.float16) if amp_enabled else autocast_ctx():
             loss = model.loss(xb, yb)
         scaler.scale(loss).backward()
         scaler.step(optim)
