@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import csv
 from contextlib import nullcontext
-from dataclasses import asdict
 from pathlib import Path
 from typing import List
 
@@ -20,7 +19,6 @@ from utils import (
     kaplan_flops_estimate,
     landscape_complexity_mu,
     load_real_token_streams,
-    save_json,
 )
 
 
@@ -30,6 +28,7 @@ RESULT_FIELDS = [
     "n_layer",
     "n_head",
     "n_embd",
+    "batch_size",
     "n_params",
     "train_tokens_target",
     "train_tokens_real",
@@ -73,6 +72,7 @@ def build_grid() -> List[RunConfig]:
                 run_name = (
                     f"s{seed}_L{model_cfg['n_layer']}"
                     f"_H{model_cfg['n_head']}_E{model_cfg['n_embd']}_T{train_tokens}"
+                    f"_B{16}"
                 )
                 grid.append(
                     RunConfig(
@@ -103,6 +103,9 @@ def train_one(
     val_tokens_stream: torch.Tensor,
     vocab_size: int,
     *,
+    dataset_name: str,
+    dataset_config: str | None,
+    tokenizer_name: str,
     use_amp: bool,
     run_idx: int,
     total_runs: int,
@@ -164,6 +167,7 @@ def train_one(
         "n_layer": cfg.n_layer,
         "n_head": cfg.n_head,
         "n_embd": cfg.n_embd,
+        "batch_size": cfg.batch_size,
         "n_params": n_params,
         "train_tokens_target": cfg.train_tokens,
         "train_tokens_real": trained_tokens,
@@ -198,7 +202,7 @@ def load_existing_rows(path: Path) -> List[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
@@ -223,7 +227,26 @@ def main() -> None:
 
     grid = build_grid()
     if args.batch_size > 0:
-        grid = [RunConfig(**{**asdict(cfg), "batch_size": args.batch_size}) for cfg in grid]
+        grid = [
+            RunConfig(
+                run_name=cfg.run_name.replace("_B16", f"_B{args.batch_size}"),
+                seed=cfg.seed,
+                vocab_size=cfg.vocab_size,
+                block_size=cfg.block_size,
+                n_layer=cfg.n_layer,
+                n_head=cfg.n_head,
+                n_embd=cfg.n_embd,
+                dropout=cfg.dropout,
+                batch_size=args.batch_size,
+                train_tokens=cfg.train_tokens,
+                val_tokens=cfg.val_tokens,
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+                mu_probe_examples=cfg.mu_probe_examples,
+                mu_probe_rank=cfg.mu_probe_rank,
+            )
+            for cfg in grid
+        ]
 
     max_train_tokens = max(cfg.train_tokens for cfg in grid)
     max_val_tokens = max(cfg.val_tokens for cfg in grid)
@@ -247,6 +270,18 @@ def main() -> None:
     def run_is_complete(cfg: RunConfig) -> bool:
         row = existing_by_name.get(cfg.run_name)
         if row is None:
+            return False
+        if row.get("dataset_name", "") != dataset_name:
+            return False
+        if row.get("dataset_config", "") != (dataset_config or ""):
+            return False
+        if row.get("tokenizer_name", "") != tokenizer_name:
+            return False
+        try:
+            row_batch = int(float(row.get("batch_size", 0)))
+        except (TypeError, ValueError):
+            return False
+        if row_batch != cfg.batch_size:
             return False
         try:
             done_tokens = int(float(row.get("train_tokens_real", 0)))
@@ -284,6 +319,9 @@ def main() -> None:
             train_tokens_stream=stream_cache[cfg.seed][0],
             val_tokens_stream=stream_cache[cfg.seed][1],
             vocab_size=stream_cache[cfg.seed][2],
+            dataset_name=dataset_name,
+            dataset_config=dataset_config,
+            tokenizer_name=tokenizer_name,
             use_amp=use_amp,
             run_idx=i,
             total_runs=total_runs,
@@ -292,10 +330,6 @@ def main() -> None:
         write_results_csv(out_rows, out_path)
         print(f"Checkpoint saved: {len(out_rows)} runs -> {out_path}", flush=True)
 
-    save_json(
-        out_path.with_suffix(".meta.json"),
-        {"num_runs_total": len(out_rows), "num_runs_new": len(pending), "resume_enabled": resume, "runs": [asdict(c) for c in grid]},
-    )
     print(f"Saved {len(out_rows)} total runs to {out_path}")
 
 

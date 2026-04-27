@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def configure_torch_cpu(num_threads: int | None = None) -> None:
@@ -215,7 +216,7 @@ def _hvp_per_example(model: TinyGPT, x_i: torch.Tensor, y_i: torch.Tensor, v: to
     # HVP needs second-order gradients; force SDPA math backend to avoid
     # unsupported double-backward paths in efficient CUDA kernels.
     if x_i.is_cuda:
-        with torch.backends.cuda.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
             loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
     else:
         loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
