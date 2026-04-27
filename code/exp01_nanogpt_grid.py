@@ -45,12 +45,15 @@ RESULT_FIELDS = [
 
 def build_grid() -> List[RunConfig]:
     grid: List[RunConfig] = []
-    seeds = [0, 1, 2, 3]
+    seeds = [0, 1, 2, 3, 4, 5]
     model_grid = [
+        {"n_layer": 2, "n_head": 2, "n_embd": 48},
+        {"n_layer": 2, "n_head": 2, "n_embd": 56},
         {"n_layer": 2, "n_head": 2, "n_embd": 64},
         {"n_layer": 2, "n_head": 2, "n_embd": 80},
         {"n_layer": 2, "n_head": 2, "n_embd": 96},
         {"n_layer": 2, "n_head": 2, "n_embd": 128},
+        {"n_layer": 3, "n_head": 4, "n_embd": 120},
         {"n_layer": 3, "n_head": 4, "n_embd": 136},
         {"n_layer": 3, "n_head": 4, "n_embd": 144},
         {"n_layer": 3, "n_head": 4, "n_embd": 160},
@@ -67,9 +70,9 @@ def build_grid() -> List[RunConfig]:
             # Keep historical anchors for continuity with previous runs.
             20_000, 40_000, 60_000, 80_000, 100_000, 150_000, 200_000, 250_000,
             300_000, 400_000, 500_000, 600_000, 800_000, 1_000_000, 1_200_000,
-            1_600_000, 2_000_000, 2_500_000, 3_200_000,
-            # Add dense geometric coverage up to 8M.
-            *[int(round(v / 1_000.0) * 1_000) for v in np.geomspace(20_000, 8_000_000, num=18)],
+            1_600_000, 2_000_000, 2_500_000, 3_200_000, 4_000_000, 5_000_000, 6_400_000, 8_000_000, 10_000_000, 12_000_000,
+            # Add dense geometric coverage up to 12M.
+            *[int(round(v / 1_000.0) * 1_000) for v in np.geomspace(20_000, 12_000_000, num=22)],
         }
     )
     for seed in seeds:
