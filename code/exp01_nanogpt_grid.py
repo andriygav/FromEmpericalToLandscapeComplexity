@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import List
@@ -98,31 +99,18 @@ def build_grid() -> List[RunConfig]:
 def train_one(
     cfg: RunConfig,
     device: torch.device,
+    train_tokens_stream: torch.Tensor,
+    val_tokens_stream: torch.Tensor,
+    vocab_size: int,
     *,
-    dataset_name: str,
-    dataset_config: str | None,
-    tokenizer_name: str,
+    use_amp: bool,
     run_idx: int,
     total_runs: int,
 ) -> dict:
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
-
-    train_tokens_stream, val_tokens_stream, vocab_size = load_real_token_streams(
-        dataset_name=dataset_name,
-        dataset_config=dataset_config,
-        tokenizer_name=tokenizer_name,
-        train_tokens=cfg.train_tokens,
-        val_tokens=cfg.val_tokens,
-        seed=cfg.seed,
-        device=device,
-    )
-    print(
-        f"[{run_idx}/{total_runs}] {cfg.run_name}: "
-        f"loaded dataset='{dataset_name}' tokenizer='{tokenizer_name}', "
-        f"train_tokens~{train_tokens_stream.numel()}, val_tokens~{val_tokens_stream.numel()}",
-        flush=True,
-    )
+    train_tokens_stream = train_tokens_stream[: cfg.train_tokens]
+    val_tokens_stream = val_tokens_stream[: cfg.val_tokens]
 
     model = TinyGPT(
         vocab_size=vocab_size,
@@ -137,15 +125,20 @@ def train_one(
     train_iter = batch_iter_from_tokens(train_tokens_stream, cfg.block_size, cfg.batch_size)
     tokens_per_step = cfg.block_size * cfg.batch_size
     max_steps = max(1, int(np.ceil(cfg.train_tokens / tokens_per_step)))
+    amp_enabled = use_amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    autocast_ctx = torch.cuda.amp.autocast if amp_enabled else nullcontext
 
     print(f"[{run_idx}/{total_runs}] {cfg.run_name}: training {max_steps} steps on {device}", flush=True)
     model.train()
     for step in range(1, max_steps + 1):
         xb, yb = next(train_iter)
         optim.zero_grad(set_to_none=True)
-        loss = model.loss(xb, yb)
-        loss.backward()
-        optim.step()
+        with autocast_ctx(dtype=torch.float16) if amp_enabled else autocast_ctx():
+            loss = model.loss(xb, yb)
+        scaler.scale(loss).backward()
+        scaler.step(optim)
+        scaler.update()
         if step == 1 or step % 200 == 0 or step == max_steps:
             print(f"[{run_idx}/{total_runs}] {cfg.run_name}: step {step}/{max_steps}, train_loss={float(loss.item()):.4f}", flush=True)
 
@@ -205,12 +198,20 @@ def load_existing_rows(path: Path) -> List[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
     dataset_name = "wikitext"
     dataset_config = "wikitext-2-raw-v1"
     tokenizer_name = "gpt2"
     resume = True
+    device = torch.device(args.device)
+    use_amp = not args.no_amp
+
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     out_path = artifacts_dir() / "results_grid.csv"
     existing_rows = load_existing_rows(out_path) if resume else []
@@ -221,6 +222,27 @@ def main() -> None:
             existing_by_name[rn] = r
 
     grid = build_grid()
+    if args.batch_size > 0:
+        grid = [RunConfig(**{**asdict(cfg), "batch_size": args.batch_size}) for cfg in grid]
+
+    max_train_tokens = max(cfg.train_tokens for cfg in grid)
+    max_val_tokens = max(cfg.val_tokens for cfg in grid)
+    stream_cache = {}
+    for seed in sorted({cfg.seed for cfg in grid}):
+        train_stream, val_stream, vocab_size = load_real_token_streams(
+            dataset_name=dataset_name,
+            dataset_config=dataset_config,
+            tokenizer_name=tokenizer_name,
+            train_tokens=max_train_tokens,
+            val_tokens=max_val_tokens,
+            seed=seed,
+            device=device,
+        )
+        stream_cache[seed] = (train_stream, val_stream, vocab_size)
+        print(
+            f"Prepared token streams for seed={seed}: train_tokens~{train_stream.numel()}, val_tokens~{val_stream.numel()}",
+            flush=True,
+        )
 
     def run_is_complete(cfg: RunConfig) -> bool:
         row = existing_by_name.get(cfg.run_name)
@@ -258,10 +280,11 @@ def main() -> None:
     for i, cfg in enumerate(pending, start=1):
         row = train_one(
             cfg,
-            device=torch.device(args.device),
-            dataset_name=dataset_name,
-            dataset_config=dataset_config,
-            tokenizer_name=tokenizer_name,
+            device=device,
+            train_tokens_stream=stream_cache[cfg.seed][0],
+            val_tokens_stream=stream_cache[cfg.seed][1],
+            vocab_size=stream_cache[cfg.seed][2],
+            use_amp=use_amp,
             run_idx=i,
             total_runs=total_runs,
         )

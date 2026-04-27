@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import math
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -55,12 +54,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask = torch.tril(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool))
-        att = att.masked_fill(~mask, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        y = att @ v
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=True,
+        )
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, channels)
         return self.proj(y)
 
@@ -148,10 +149,12 @@ def kaplan_flops_estimate(n_params: int, n_tokens: int, flops_per_param_token: f
 
 def batch_iter_from_tokens(tokens: torch.Tensor, block_size: int, batch_size: int) -> Iterable[Tuple[torch.Tensor, torch.Tensor]]:
     max_start = tokens.numel() - block_size - 1
+    offsets = torch.arange(block_size, device=tokens.device)
     while True:
         starts = torch.randint(0, max_start, (batch_size,), device=tokens.device)
-        x = torch.stack([tokens[s : s + block_size] for s in starts], dim=0)
-        y = torch.stack([tokens[s + 1 : s + block_size + 1] for s in starts], dim=0)
+        idx = starts.unsqueeze(1) + offsets.unsqueeze(0)
+        x = tokens[idx]
+        y = tokens[idx + 1]
         yield x, y
 
 
