@@ -45,7 +45,7 @@ RESULT_FIELDS = [
 
 def build_grid() -> List[RunConfig]:
     grid: List[RunConfig] = []
-    seeds = [0, 1]
+    seeds = [0, 1, 2, 3]
     model_grid = [
         {"n_layer": 2, "n_head": 2, "n_embd": 64},
         {"n_layer": 2, "n_head": 2, "n_embd": 80},
@@ -60,12 +60,18 @@ def build_grid() -> List[RunConfig]:
         {"n_layer": 5, "n_head": 8, "n_embd": 224},
         {"n_layer": 6, "n_head": 8, "n_embd": 256},
     ]
-    token_grid = [
-        20_000, 40_000, 60_000,
-        80_000, 100_000, 150_000, 200_000, 250_000, 300_000, 400_000, 500_000, 600_000, 800_000,
-        1_000_000, 1_200_000, 1_600_000,
-        2_000_000, 2_500_000, 3_200_000,
-    ]
+    # Dense log-spaced token budgets to better resolve both branches
+    # of iso-curves (especially the right branch at high D/N).
+    token_grid = sorted(
+        {
+            # Keep historical anchors for continuity with previous runs.
+            20_000, 40_000, 60_000, 80_000, 100_000, 150_000, 200_000, 250_000,
+            300_000, 400_000, 500_000, 600_000, 800_000, 1_000_000, 1_200_000,
+            1_600_000, 2_000_000, 2_500_000, 3_200_000,
+            # Add dense geometric coverage up to 8M.
+            *[int(round(v / 1_000.0) * 1_000) for v in np.geomspace(20_000, 8_000_000, num=18)],
+        }
+    )
     for seed in seeds:
         for model_cfg in model_grid:
             for train_tokens in token_grid:
