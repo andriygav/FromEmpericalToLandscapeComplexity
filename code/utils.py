@@ -134,7 +134,6 @@ class RunConfig:
     val_tokens: int
     lr: float
     weight_decay: float
-    max_steps: int
     mu_probe_examples: int
     mu_probe_rank: int
 

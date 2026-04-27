@@ -88,7 +88,6 @@ def build_grid() -> List[RunConfig]:
                         val_tokens=100_000,
                         lr=3e-4,
                         weight_decay=0.01,
-                        max_steps=1200,
                         mu_probe_examples=8,
                         mu_probe_rank=4,
                     )
@@ -137,7 +136,7 @@ def train_one(
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     train_iter = batch_iter_from_tokens(train_tokens_stream, cfg.block_size, cfg.batch_size)
     tokens_per_step = cfg.block_size * cfg.batch_size
-    max_steps = min(cfg.max_steps, max(1, cfg.train_tokens // tokens_per_step))
+    max_steps = max(1, int(np.ceil(cfg.train_tokens / tokens_per_step)))
 
     print(f"[{run_idx}/{total_runs}] {cfg.run_name}: training {max_steps} steps on {device}", flush=True)
     model.train()
@@ -215,14 +214,38 @@ def main() -> None:
 
     out_path = artifacts_dir() / "results_grid.csv"
     existing_rows = load_existing_rows(out_path) if resume else []
-    done_run_names = {r.get("run_name", "") for r in existing_rows}
+    existing_by_name = {}
+    for r in existing_rows:
+        rn = r.get("run_name", "")
+        if rn:
+            existing_by_name[rn] = r
 
     grid = build_grid()
-    pending = [cfg for cfg in grid if cfg.run_name not in done_run_names]
+
+    def run_is_complete(cfg: RunConfig) -> bool:
+        row = existing_by_name.get(cfg.run_name)
+        if row is None:
+            return False
+        try:
+            done_tokens = int(float(row.get("train_tokens_real", 0)))
+        except (TypeError, ValueError):
+            return False
+        tokens_per_step = cfg.block_size * cfg.batch_size
+        # Backward-compatible tolerance: old runs may undershoot by up to one step.
+        required_tokens = max(0, cfg.train_tokens - tokens_per_step)
+        return done_tokens >= required_tokens
+
+    pending = [cfg for cfg in grid if not run_is_complete(cfg)]
+    complete_names = {cfg.run_name for cfg in grid if run_is_complete(cfg)}
+    stale_names = {cfg.run_name for cfg in grid if cfg.run_name not in complete_names}
 
     if existing_rows:
-        print(f"Resume mode: found {len(existing_rows)} completed runs in {out_path}, pending {len(pending)} runs.", flush=True)
-        skipped = [cfg.run_name for cfg in grid if cfg.run_name in done_run_names]
+        print(
+            f"Resume mode: found {len(existing_rows)} rows in {out_path}, "
+            f"complete {len(complete_names)} runs, stale {len(stale_names)}, pending {len(pending)} runs.",
+            flush=True,
+        )
+        skipped = [cfg.run_name for cfg in grid if cfg.run_name in complete_names]
         print(f"Skipped runs ({len(skipped)}):", flush=True)
         for s in skipped:
             print(f"  - {s}", flush=True)
@@ -230,7 +253,7 @@ def main() -> None:
         print(f"Output file: {out_path}", flush=True)
         print(f"Starting fresh: pending {len(pending)} runs.", flush=True)
 
-    out_rows = list(existing_rows)
+    out_rows = [r for r in existing_rows if r.get("run_name", "") in complete_names]
     total_runs = len(pending)
     for i, cfg in enumerate(pending, start=1):
         row = train_one(
