@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=8)
     parser.add_argument("--max-train-tokens", type=int, default=12_000_000)
     parser.add_argument("--checkpoints", type=int, default=20)
-    parser.add_argument("--mu-every", type=int, default=2, help="Compute mu every K checkpoints.")
+    parser.add_argument("--mu-every", type=int, default=1, help="Compute mu every K checkpoints.")
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
