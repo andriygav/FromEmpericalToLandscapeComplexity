@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import argparse
 import csv
-from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 import numpy as np
 import torch
+from transformers import GPT2Config, GPT2LMHeadModel
 
 from utils import (
-    RunConfig,
-    TinyGPT,
     artifacts_dir,
     batch_iter_from_tokens,
     count_parameters,
@@ -25,12 +24,14 @@ from utils import (
 RESULT_FIELDS = [
     "run_name",
     "seed",
+    "model_id",
     "n_layer",
     "n_head",
     "n_embd",
     "batch_size",
     "n_params",
-    "train_tokens_target",
+    "checkpoint_idx",
+    "checkpoint_tokens_target",
     "train_tokens_real",
     "val_loss",
     "val_ppl",
@@ -43,162 +44,39 @@ RESULT_FIELDS = [
 ]
 
 
-def build_grid() -> List[RunConfig]:
-    grid: List[RunConfig] = []
-    seeds = [0, 1, 2, 3, 4, 5]
-    model_grid = [
-        {"n_layer": 2, "n_head": 2, "n_embd": 48},
-        {"n_layer": 2, "n_head": 2, "n_embd": 56},
-        {"n_layer": 2, "n_head": 2, "n_embd": 64},
-        {"n_layer": 2, "n_head": 2, "n_embd": 80},
-        {"n_layer": 2, "n_head": 2, "n_embd": 96},
-        {"n_layer": 2, "n_head": 2, "n_embd": 128},
-        {"n_layer": 3, "n_head": 4, "n_embd": 120},
-        {"n_layer": 3, "n_head": 4, "n_embd": 136},
-        {"n_layer": 3, "n_head": 4, "n_embd": 144},
-        {"n_layer": 3, "n_head": 4, "n_embd": 160},
-        {"n_layer": 4, "n_head": 4, "n_embd": 192},
-        {"n_layer": 5, "n_head": 8, "n_embd": 200},
-        {"n_layer": 5, "n_head": 8, "n_embd": 208},
-        {"n_layer": 5, "n_head": 8, "n_embd": 224},
-        {"n_layer": 6, "n_head": 8, "n_embd": 256},
-    ]
-    # Dense log-spaced token budgets to better resolve both branches
-    # of iso-curves (especially the right branch at high D/N).
-    token_grid = sorted(
-        {
-            # Keep historical anchors for continuity with previous runs.
-            20_000, 40_000, 60_000, 80_000, 100_000, 150_000, 200_000, 250_000,
-            300_000, 400_000, 500_000, 600_000, 800_000, 1_000_000, 1_200_000,
-            1_600_000, 2_000_000, 2_500_000, 3_200_000, 4_000_000, 5_000_000, 6_400_000, 8_000_000, 10_000_000, 12_000_000,
-            # Add dense geometric coverage up to 12M.
-            *[int(round(v / 1_000.0) * 1_000) for v in np.geomspace(20_000, 12_000_000, num=22)],
-        }
-    )
-    for seed in seeds:
-        for model_cfg in model_grid:
-            for train_tokens in token_grid:
-                run_name = (
-                    f"s{seed}_L{model_cfg['n_layer']}"
-                    f"_H{model_cfg['n_head']}_E{model_cfg['n_embd']}_T{train_tokens}"
-                    f"_B{16}"
-                )
-                grid.append(
-                    RunConfig(
-                        run_name=run_name,
-                        seed=seed,
-                        vocab_size=2048,
-                        block_size=128,
-                        n_layer=model_cfg["n_layer"],
-                        n_head=model_cfg["n_head"],
-                        n_embd=model_cfg["n_embd"],
-                        dropout=0.0,
-                        batch_size=16,
-                        train_tokens=train_tokens,
-                        val_tokens=100_000,
-                        lr=3e-4,
-                        weight_decay=0.01,
-                        mu_probe_examples=8,
-                        mu_probe_rank=4,
-                    )
-                )
-    return grid
+@dataclass(frozen=True)
+class ModelSpec:
+    model_id: str
+    n_layer: int
+    n_head: int
+    n_embd: int
 
 
-def train_one(
-    cfg: RunConfig,
-    device: torch.device,
-    train_tokens_stream: torch.Tensor,
-    val_tokens_stream: torch.Tensor,
-    vocab_size: int,
-    *,
-    dataset_name: str,
-    dataset_config: str | None,
-    tokenizer_name: str,
-    use_amp: bool,
-    run_idx: int,
-    total_runs: int,
-) -> dict:
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    train_tokens_stream = train_tokens_stream[: cfg.train_tokens]
-    val_tokens_stream = val_tokens_stream[: cfg.val_tokens]
+def build_model_grid() -> List[ModelSpec]:
+    depths = [2, 3, 4, 5, 6, 7]
+    widths = [48, 64, 80, 96, 112, 128]
+    specs: List[ModelSpec] = []
+    for d in depths:
+        for w in widths:
+            h = 2 if w <= 96 else 4
+            assert w % h == 0
+            specs.append(ModelSpec(model_id=f"L{d}_H{h}_E{w}", n_layer=d, n_head=h, n_embd=w))
+    return specs
 
-    model = TinyGPT(
-        vocab_size=vocab_size,
-        block_size=cfg.block_size,
-        n_layer=cfg.n_layer,
-        n_head=cfg.n_head,
-        n_embd=cfg.n_embd,
-        dropout=cfg.dropout,
-    ).to(device)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    train_iter = batch_iter_from_tokens(train_tokens_stream, cfg.block_size, cfg.batch_size)
-    tokens_per_step = cfg.block_size * cfg.batch_size
-    max_steps = max(1, int(np.ceil(cfg.train_tokens / tokens_per_step)))
-    amp_enabled = use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    autocast_ctx = torch.amp.autocast if amp_enabled else nullcontext
-
-    print(f"[{run_idx}/{total_runs}] {cfg.run_name}: training {max_steps} steps on {device}", flush=True)
-    model.train()
-    for step in range(1, max_steps + 1):
-        xb, yb = next(train_iter)
-        optim.zero_grad(set_to_none=True)
-        with autocast_ctx("cuda", dtype=torch.float16) if amp_enabled else autocast_ctx():
-            loss = model.loss(xb, yb)
-        scaler.scale(loss).backward()
-        scaler.step(optim)
-        scaler.update()
-        if step == 1 or step % 200 == 0 or step == max_steps:
-            print(f"[{run_idx}/{total_runs}] {cfg.run_name}: step {step}/{max_steps}, train_loss={float(loss.item()):.4f}", flush=True)
-
-    val_loss = evaluate_val_loss(model=model, val_tokens=val_tokens_stream, block_size=cfg.block_size, batch_size=cfg.batch_size, n_batches=20)
-    ppl = float(np.exp(val_loss))
-
-    xb_mu, yb_mu = next(train_iter)
-    print(f"[{run_idx}/{total_runs}] {cfg.run_name}: computing mu...", flush=True)
-    mu = landscape_complexity_mu(model=model, x=xb_mu, y=yb_mu, rank=cfg.mu_probe_rank, n_examples=cfg.mu_probe_examples)
-
-    n_params = count_parameters(model)
-    trained_tokens = int(max_steps * tokens_per_step)
-    flops = kaplan_flops_estimate(n_params=n_params, n_tokens=trained_tokens)
-
-    print(
-        f"[{run_idx}/{total_runs}] {cfg.run_name}: done val_loss={val_loss:.4f}, ppl={ppl:.2f}, mu={mu:.6g}, N={n_params}, D={trained_tokens}",
-        flush=True,
-    )
-
-    return {
-        "run_name": cfg.run_name,
-        "seed": cfg.seed,
-        "n_layer": cfg.n_layer,
-        "n_head": cfg.n_head,
-        "n_embd": cfg.n_embd,
-        "batch_size": cfg.batch_size,
-        "n_params": n_params,
-        "train_tokens_target": cfg.train_tokens,
-        "train_tokens_real": trained_tokens,
-        "val_loss": val_loss,
-        "val_ppl": ppl,
-        "mu_landscape": mu,
-        "flops_estimate": flops,
-        "d_over_n": float(trained_tokens / max(n_params, 1)),
-        "dataset_name": dataset_name,
-        "dataset_config": dataset_config,
-        "tokenizer_name": tokenizer_name,
-    }
+def build_checkpoint_tokens(max_train_tokens: int, n_points: int) -> List[int]:
+    vals = np.geomspace(20_000, max_train_tokens, num=n_points)
+    out = sorted({int(round(v / 1_000.0) * 1_000) for v in vals})
+    return [v for v in out if v > 0]
 
 
 def write_results_csv(rows: List[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = list(RESULT_FIELDS)
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fields})
+        w = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in RESULT_FIELDS})
 
 
 def load_existing_rows(path: Path) -> List[dict]:
@@ -212,6 +90,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--seeds", type=int, default=2)
+    parser.add_argument("--max-train-tokens", type=int, default=12_000_000)
+    parser.add_argument("--checkpoints", type=int, default=20)
+    parser.add_argument("--mu-every", type=int, default=2, help="Compute mu every K checkpoints.")
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
@@ -219,127 +101,161 @@ def main() -> None:
     dataset_config = "wikitext-103-raw-v1"
     tokenizer_name = "gpt2"
     resume = True
+
     device = torch.device(args.device)
     use_amp = not args.no_amp
-
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    model_specs = build_model_grid()
+    seeds = list(range(max(1, args.seeds)))
+    checkpoints = build_checkpoint_tokens(max_train_tokens=args.max_train_tokens, n_points=args.checkpoints)
+    print(
+        f"Planned token-sliced run: models={len(model_specs)}, seeds={len(seeds)}, "
+        f"max_train_tokens={args.max_train_tokens}, checkpoints/model={len(checkpoints)}, "
+        f"total_rows={len(model_specs) * len(seeds) * len(checkpoints)}",
+        flush=True,
+    )
+
     out_path = artifacts_dir() / "results_grid.csv"
     existing_rows = load_existing_rows(out_path) if resume else []
-    existing_by_name = {}
-    for r in existing_rows:
-        rn = r.get("run_name", "")
-        if rn:
-            existing_by_name[rn] = r
+    existing_run_names = {r.get("run_name", "") for r in existing_rows}
 
-    grid = build_grid()
-    if args.batch_size > 0:
-        grid = [
-            RunConfig(
-                run_name=cfg.run_name.replace("_B16", f"_B{args.batch_size}"),
-                seed=cfg.seed,
-                vocab_size=cfg.vocab_size,
-                block_size=cfg.block_size,
-                n_layer=cfg.n_layer,
-                n_head=cfg.n_head,
-                n_embd=cfg.n_embd,
-                dropout=cfg.dropout,
-                batch_size=args.batch_size,
-                train_tokens=cfg.train_tokens,
-                val_tokens=cfg.val_tokens,
-                lr=cfg.lr,
-                weight_decay=cfg.weight_decay,
-                mu_probe_examples=cfg.mu_probe_examples,
-                mu_probe_rank=cfg.mu_probe_rank,
-            )
-            for cfg in grid
-        ]
-
-    max_train_tokens = max(cfg.train_tokens for cfg in grid)
-    max_val_tokens = max(cfg.val_tokens for cfg in grid)
+    max_val_tokens = 100_000
     stream_cache = {}
-    for seed in sorted({cfg.seed for cfg in grid}):
+    for seed in seeds:
         train_stream, val_stream, vocab_size = load_real_token_streams(
             dataset_name=dataset_name,
             dataset_config=dataset_config,
             tokenizer_name=tokenizer_name,
-            train_tokens=max_train_tokens,
+            train_tokens=args.max_train_tokens,
             val_tokens=max_val_tokens,
             seed=seed,
             device=device,
         )
         stream_cache[seed] = (train_stream, val_stream, vocab_size)
         print(
-            f"Prepared token streams for seed={seed}: train_tokens~{train_stream.numel()}, val_tokens~{val_stream.numel()}",
+            f"Prepared streams seed={seed}: train_tokens~{train_stream.numel()}, val_tokens~{val_stream.numel()}",
             flush=True,
         )
 
-    def run_is_complete(cfg: RunConfig) -> bool:
-        row = existing_by_name.get(cfg.run_name)
-        if row is None:
-            return False
-        if row.get("dataset_name", "") != dataset_name:
-            return False
-        if row.get("dataset_config", "") != (dataset_config or ""):
-            return False
-        if row.get("tokenizer_name", "") != tokenizer_name:
-            return False
-        try:
-            row_batch = int(float(row.get("batch_size", 0)))
-        except (TypeError, ValueError):
-            return False
-        if row_batch != cfg.batch_size:
-            return False
-        try:
-            done_tokens = int(float(row.get("train_tokens_real", 0)))
-        except (TypeError, ValueError):
-            return False
-        tokens_per_step = cfg.block_size * cfg.batch_size
-        # Backward-compatible tolerance: old runs may undershoot by up to one step.
-        required_tokens = max(0, cfg.train_tokens - tokens_per_step)
-        return done_tokens >= required_tokens
+    out_rows = list(existing_rows)
+    total_runs = len(model_specs) * len(seeds)
+    run_idx = 0
+    for seed in seeds:
+        for spec in model_specs:
+            run_idx += 1
+            base_name = f"s{seed}_{spec.model_id}_B{args.batch_size}"
+            expected_names = [f"{base_name}_T{t}" for t in checkpoints]
+            if all(n in existing_run_names for n in expected_names):
+                print(f"[{run_idx}/{total_runs}] {base_name}: all checkpoints already present, skip", flush=True)
+                continue
 
-    pending = [cfg for cfg in grid if not run_is_complete(cfg)]
-    complete_names = {cfg.run_name for cfg in grid if run_is_complete(cfg)}
-    stale_names = {cfg.run_name for cfg in grid if cfg.run_name not in complete_names}
+            train_tokens_stream, val_tokens_stream, vocab_size = stream_cache[seed]
+            config = GPT2Config(
+                vocab_size=vocab_size,
+                n_positions=128,
+                n_ctx=128,
+                n_layer=spec.n_layer,
+                n_head=spec.n_head,
+                n_embd=spec.n_embd,
+                resid_pdrop=0.0,
+                embd_pdrop=0.0,
+                attn_pdrop=0.0,
+            )
+            model = GPT2LMHeadModel(config).to(device)
 
-    if existing_rows:
-        print(
-            f"Resume mode: found {len(existing_rows)} rows in {out_path}, "
-            f"complete {len(complete_names)} runs, stale {len(stale_names)}, pending {len(pending)} runs.",
-            flush=True,
-        )
-        skipped = [cfg.run_name for cfg in grid if cfg.run_name in complete_names]
-        print(f"Skipped runs ({len(skipped)}):", flush=True)
-        for s in skipped:
-            print(f"  - {s}", flush=True)
-    else:
-        print(f"Output file: {out_path}", flush=True)
-        print(f"Starting fresh: pending {len(pending)} runs.", flush=True)
+            # Keep compatibility with existing utilities expecting model.loss(x, y).
+            model.loss = lambda x, y: model(input_ids=x, labels=y).loss  # type: ignore[attr-defined]
+            optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+            train_iter = batch_iter_from_tokens(train_tokens_stream, 128, args.batch_size)
+            tokens_per_step = 128 * args.batch_size
+            max_steps = max(1, int(np.ceil(args.max_train_tokens / tokens_per_step)))
+            amp_enabled = use_amp and device.type == "cuda"
+            scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    out_rows = [r for r in existing_rows if r.get("run_name", "") in complete_names]
-    total_runs = len(pending)
-    for i, cfg in enumerate(pending, start=1):
-        row = train_one(
-            cfg,
-            device=device,
-            train_tokens_stream=stream_cache[cfg.seed][0],
-            val_tokens_stream=stream_cache[cfg.seed][1],
-            vocab_size=stream_cache[cfg.seed][2],
-            dataset_name=dataset_name,
-            dataset_config=dataset_config,
-            tokenizer_name=tokenizer_name,
-            use_amp=use_amp,
-            run_idx=i,
-            total_runs=total_runs,
-        )
-        out_rows.append(row)
-        write_results_csv(out_rows, out_path)
-        print(f"Checkpoint saved: {len(out_rows)} runs -> {out_path}", flush=True)
+            checkpoint_ptr = 0
+            print(f"[{run_idx}/{total_runs}] {base_name}: training {max_steps} steps", flush=True)
+            model.train()
+            for step in range(1, max_steps + 1):
+                xb, yb = next(train_iter)
+                optim.zero_grad(set_to_none=True)
+                if amp_enabled:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        loss = model.loss(xb, yb)
+                else:
+                    loss = model.loss(xb, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
 
-    print(f"Saved {len(out_rows)} total runs to {out_path}")
+                trained_tokens = int(step * tokens_per_step)
+                while checkpoint_ptr < len(checkpoints) and trained_tokens >= checkpoints[checkpoint_ptr]:
+                    ckpt_tokens = checkpoints[checkpoint_ptr]
+                    run_name = f"{base_name}_T{ckpt_tokens}"
+                    checkpoint_idx = checkpoint_ptr + 1
+                    checkpoint_ptr += 1
+                    if run_name in existing_run_names:
+                        continue
+
+                    val_loss = evaluate_val_loss(
+                        model=model,
+                        val_tokens=val_tokens_stream,
+                        block_size=128,
+                        batch_size=args.batch_size,
+                        n_batches=20,
+                    )
+                    ppl = float(np.exp(val_loss))
+                    mu = np.nan
+                    if (checkpoint_idx - 1) % max(1, args.mu_every) == 0:
+                        xb_mu, yb_mu = next(train_iter)
+                        mu = landscape_complexity_mu(
+                            model=model,
+                            x=xb_mu,
+                            y=yb_mu,
+                            rank=4,
+                            n_examples=8,
+                        )
+                    n_params = count_parameters(model)
+                    flops = kaplan_flops_estimate(n_params=n_params, n_tokens=trained_tokens)
+                    row = {
+                        "run_name": run_name,
+                        "seed": seed,
+                        "model_id": spec.model_id,
+                        "n_layer": spec.n_layer,
+                        "n_head": spec.n_head,
+                        "n_embd": spec.n_embd,
+                        "batch_size": args.batch_size,
+                        "n_params": n_params,
+                        "checkpoint_idx": checkpoint_idx,
+                        "checkpoint_tokens_target": ckpt_tokens,
+                        "train_tokens_real": trained_tokens,
+                        "val_loss": val_loss,
+                        "val_ppl": ppl,
+                        "mu_landscape": mu,
+                        "flops_estimate": flops,
+                        "d_over_n": float(trained_tokens / max(n_params, 1)),
+                        "dataset_name": dataset_name,
+                        "dataset_config": dataset_config,
+                        "tokenizer_name": tokenizer_name,
+                    }
+                    out_rows.append(row)
+                    existing_run_names.add(run_name)
+                    write_results_csv(out_rows, out_path)
+                    print(
+                        f"[{run_idx}/{total_runs}] {run_name}: val_loss={val_loss:.4f}, "
+                        f"mu={mu if np.isfinite(mu) else float('nan'):.6g}",
+                        flush=True,
+                    )
+
+                if step == 1 or step % 300 == 0 or step == max_steps:
+                    print(
+                        f"[{run_idx}/{total_runs}] {base_name}: step {step}/{max_steps}, train_loss={float(loss.item()):.4f}",
+                        flush=True,
+                    )
+
+    print(f"Saved {len(out_rows)} rows to {out_path}", flush=True)
 
 
 if __name__ == "__main__":

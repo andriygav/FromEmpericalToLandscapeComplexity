@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
@@ -36,108 +34,6 @@ def artifacts_dir() -> Path:
 def save_json(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2))
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, dropout: float) -> None:
-        super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
-        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, seqlen, channels = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(channels, dim=-1)
-        q = q.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=True,
-        )
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, channels)
-        return self.proj(y)
-
-
-class Block(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, dropout: float) -> None:
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd=n_embd, n_head=n_head, dropout=dropout)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.ff = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd, bias=False),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd, bias=False),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ff(self.ln2(x))
-        return x
-
-
-class TinyGPT(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        block_size: int,
-        n_layer: int,
-        n_head: int,
-        n_embd: int,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.block_size = block_size
-        self.token_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([Block(n_embd, n_head, dropout) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        bsz, seqlen = idx.shape
-        pos = torch.arange(0, seqlen, device=idx.device, dtype=torch.long).unsqueeze(0)
-        x = self.token_emb(idx) + self.pos_emb(pos)
-        x = self.drop(x)
-        for block in self.blocks:
-            x = block(x)
-        x = self.ln_f(x)
-        return self.lm_head(x)
-
-    def loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        logits = self.forward(x)
-        return F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-
-
-@dataclass(frozen=True)
-class RunConfig:
-    run_name: str
-    seed: int
-    vocab_size: int
-    block_size: int
-    n_layer: int
-    n_head: int
-    n_embd: int
-    dropout: float
-    batch_size: int
-    train_tokens: int
-    val_tokens: int
-    lr: float
-    weight_decay: float
-    mu_probe_examples: int
-    mu_probe_rank: int
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -211,15 +107,25 @@ def load_real_token_streams(
     return train_ids, val_ids, int(tok.vocab_size)
 
 
-def _hvp_per_example(model: TinyGPT, x_i: torch.Tensor, y_i: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _model_loss(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    loss_fn = getattr(model, "loss", None)
+    if callable(loss_fn):
+        return loss_fn(x, y)
+    out: Any = model(input_ids=x, labels=y)
+    if hasattr(out, "loss"):
+        return out.loss
+    raise AttributeError("Model must expose .loss(x, y) or return .loss from forward(input_ids, labels).")
+
+
+def _hvp_per_example(model: nn.Module, x_i: torch.Tensor, y_i: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     params = [p for p in model.parameters() if p.requires_grad]
     # HVP needs second-order gradients; force SDPA math backend to avoid
     # unsupported double-backward paths in efficient CUDA kernels.
     if x_i.is_cuda:
         with sdpa_kernel(backends=[SDPBackend.MATH]):
-            loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
+            loss_i = _model_loss(model, x_i.unsqueeze(0), y_i.unsqueeze(0))
     else:
-        loss_i = model.loss(x_i.unsqueeze(0), y_i.unsqueeze(0))
+        loss_i = _model_loss(model, x_i.unsqueeze(0), y_i.unsqueeze(0))
     g = torch.autograd.grad(loss_i, params, create_graph=True)
     g_flat = torch.cat([t.reshape(-1) for t in g])
     gv = torch.dot(g_flat, v)
@@ -228,7 +134,7 @@ def _hvp_per_example(model: TinyGPT, x_i: torch.Tensor, y_i: torch.Tensor, v: to
 
 
 def landscape_complexity_mu(
-    model: TinyGPT,
+    model: nn.Module,
     x: torch.Tensor,
     y: torch.Tensor,
     rank: int,
@@ -273,13 +179,13 @@ def landscape_complexity_mu(
     return mu_sum / max(seen, 1)
 
 
-def evaluate_val_loss(model: TinyGPT, val_tokens: torch.Tensor, block_size: int, batch_size: int, n_batches: int = 20) -> float:
+def evaluate_val_loss(model: nn.Module, val_tokens: torch.Tensor, block_size: int, batch_size: int, n_batches: int = 20) -> float:
     model.eval()
     it = batch_iter_from_tokens(val_tokens, block_size, batch_size)
     losses = []
     with torch.no_grad():
         for _ in range(n_batches):
             xb, yb = next(it)
-            losses.append(float(model.loss(xb, yb).item()))
+            losses.append(float(_model_loss(model, xb, yb).item()))
     model.train()
     return float(np.mean(losses))
