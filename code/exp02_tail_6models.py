@@ -122,9 +122,11 @@ def main() -> None:
     existing_rows = load_existing_rows(out_path) if resume else []
     existing_run_names = {r.get("run_name", "") for r in existing_rows}
 
-    max_val_tokens = 100_000
-    stream_cache = {}
+    out_rows = list(existing_rows)
+    total_runs = len(model_specs) * len(seeds)
+    run_idx = 0
     for seed in seeds:
+        max_val_tokens = 100_000
         train_stream, val_stream, vocab_size = load_real_token_streams(
             dataset_name=dataset_name,
             dataset_config=dataset_config,
@@ -134,16 +136,11 @@ def main() -> None:
             seed=seed,
             device=device,
         )
-        stream_cache[seed] = (train_stream, val_stream, vocab_size)
         print(
             f"Prepared streams seed={seed}: train_tokens~{train_stream.numel()}, val_tokens~{val_stream.numel()}",
             flush=True,
         )
 
-    out_rows = list(existing_rows)
-    total_runs = len(model_specs) * len(seeds)
-    run_idx = 0
-    for seed in seeds:
         for spec in model_specs:
             run_idx += 1
             base_name = f"tail_s{seed}_{spec.model_id}_B{args.batch_size}"
@@ -152,7 +149,6 @@ def main() -> None:
                 print(f"[{run_idx}/{total_runs}] {base_name}: all checkpoints already present, skip", flush=True)
                 continue
 
-            train_tokens_stream, val_tokens_stream, vocab_size = stream_cache[seed]
             config = GPT2Config(
                 vocab_size=vocab_size,
                 n_positions=128,
@@ -167,7 +163,7 @@ def main() -> None:
             model = GPT2LMHeadModel(config).to(device)
             model.loss = lambda x, y: model(input_ids=x, labels=y).loss  # type: ignore[attr-defined]
             optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-            train_iter = batch_iter_from_tokens(train_tokens_stream, 128, args.batch_size)
+            train_iter = batch_iter_from_tokens(train_stream, 128, args.batch_size)
             tokens_per_step = 128 * args.batch_size
             max_steps = max(1, int(np.ceil(args.max_train_tokens / tokens_per_step)))
             amp_enabled = use_amp and device.type == "cuda"
@@ -199,7 +195,7 @@ def main() -> None:
 
                     val_loss = evaluate_val_loss(
                         model=model,
-                        val_tokens=val_tokens_stream,
+                        val_tokens=val_stream,
                         block_size=128,
                         batch_size=args.batch_size,
                         n_batches=20,
@@ -247,6 +243,11 @@ def main() -> None:
                         f"[{run_idx}/{total_runs}] {base_name}: step {step}/{max_steps}, train_loss={float(loss.item()):.4f}",
                         flush=True,
                     )
+
+        # Keep memory bounded: hold token streams only for one seed.
+        del train_stream, val_stream
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     print(f"Saved {len(out_rows)} rows to {out_path}", flush=True)
 
