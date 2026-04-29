@@ -87,19 +87,32 @@ def load_real_token_streams(
     rng.shuffle(val_texts)
 
     def tokenize_until_budget(texts: List[str], budget: int) -> torch.Tensor:
+        # Batched tokenization is much faster than per-text encode loops.
         chunks: List[torch.Tensor] = []
         total = 0
-        for txt in texts:
-            if not txt or not txt.strip():
-                continue
-            ids = tok.encode(txt, add_special_tokens=False)
-            if not ids:
-                continue
-            t = torch.tensor(ids, dtype=torch.long)
-            chunks.append(t)
-            total += int(t.numel())
-            if total >= budget:
-                break
+        batch_size = 512
+
+        filtered = [t for t in texts if t and t.strip()]
+        for i in range(0, len(filtered), batch_size):
+            batch = filtered[i : i + batch_size]
+            enc = tok(
+                batch,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+            )
+            for ids in enc["input_ids"]:
+                if not ids:
+                    continue
+                t = torch.tensor(ids, dtype=torch.long)
+                chunks.append(t)
+                total += int(t.numel())
+                if total >= budget:
+                    return torch.cat(chunks, dim=0)[:budget].to(device)
+
+        if not chunks:
+            return torch.empty(0, dtype=torch.long, device=device)
         return torch.cat(chunks, dim=0)[:budget].to(device)
 
     train_ids = tokenize_until_budget(train_texts, train_tokens + 5000)
