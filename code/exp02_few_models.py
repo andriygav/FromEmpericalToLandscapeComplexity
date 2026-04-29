@@ -120,12 +120,6 @@ def main() -> None:
         n_points=args.checkpoints,
         min_tokens=args.min_checkpoint_tokens,
     )
-    print(
-        f"Few-model run: models={len(model_specs)}, seeds={len(seeds)}, "
-        f"max_train_tokens={args.max_train_tokens}, checkpoints/model={len(checkpoints)}, "
-        f"total_rows={len(model_specs) * len(seeds) * len(checkpoints)}",
-        flush=True,
-    )
 
     out_path = artifacts_dir() / args.out_csv
     existing_rows = load_existing_rows(out_path) if resume else []
@@ -146,17 +140,12 @@ def main() -> None:
             seed=seed,
             device=device,
         )
-        print(
-            f"Prepared streams seed={seed}: train_tokens~{train_stream.numel()}, val_tokens~{val_stream.numel()}",
-            flush=True,
-        )
 
         for spec in model_specs:
             run_idx += 1
             base_name = f"few_s{seed}_{spec.model_id}_B{args.batch_size}"
             expected_names = [f"{base_name}_T{t}" for t in checkpoints]
             if all(n in existing_run_names for n in expected_names):
-                print(f"[{run_idx}/{total_runs}] {base_name}: all checkpoints already present, skip", flush=True)
                 runs_pbar.update(1)
                 continue
 
@@ -190,7 +179,6 @@ def main() -> None:
                 return args.min_lr + (args.lr - args.min_lr) * cosine
 
             checkpoint_ptr = 0
-            print(f"[{run_idx}/{total_runs}] {base_name}: training {max_steps} steps", flush=True)
             model.train()
             steps_pbar = tqdm(total=max_steps, desc=base_name, leave=False, unit="step")
             last_ckpt_msg = "-"
@@ -259,18 +247,6 @@ def main() -> None:
                     existing_run_names.add(run_name)
                     write_results_csv(out_rows, out_path)
                     last_ckpt_msg = f"T{ckpt_tokens} L={val_loss:.3f} mu={mu if np.isfinite(mu) else float('nan'):.3g}"
-                    print(
-                        f"[{run_idx}/{total_runs}] {run_name}: val_loss={val_loss:.4f}, "
-                        f"mu={mu if np.isfinite(mu) else float('nan'):.6g}",
-                        flush=True,
-                    )
-
-                if step == 1 or step % 500 == 0 or step == max_steps:
-                    print(
-                        f"[{run_idx}/{total_runs}] {base_name}: step {step}/{max_steps}, "
-                        f"train_loss={float(loss.item()):.4f}, lr={lr_now:.2e}",
-                        flush=True,
-                    )
                 steps_pbar.set_postfix(loss=f"{float(loss.item()):.4f}", lr=f"{lr_now:.2e}", ckpt=last_ckpt_msg)
                 steps_pbar.update(1)
             steps_pbar.close()
