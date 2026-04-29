@@ -90,7 +90,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seeds", type=int, default=8)
-    parser.add_argument("--max-train-tokens", type=int, default=100_000_000)
+    parser.add_argument("--max-train-tokens", type=int, default=150_000_000)
     parser.add_argument("--min-checkpoint-tokens", type=int, default=20_000)
     parser.add_argument("--checkpoints", type=int, default=36)
     parser.add_argument("--mu-every", type=int, default=1)
