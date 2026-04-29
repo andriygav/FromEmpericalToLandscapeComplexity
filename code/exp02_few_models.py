@@ -9,6 +9,7 @@ from typing import List
 import numpy as np
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel
+from tqdm import tqdm
 
 from utils import (
     artifacts_dir,
@@ -132,6 +133,7 @@ def main() -> None:
 
     out_rows = list(existing_rows)
     total_runs = len(model_specs) * len(seeds)
+    runs_pbar = tqdm(total=total_runs, desc="few-model runs", unit="run")
     run_idx = 0
     for seed in seeds:
         max_val_tokens = 100_000
@@ -155,6 +157,7 @@ def main() -> None:
             expected_names = [f"{base_name}_T{t}" for t in checkpoints]
             if all(n in existing_run_names for n in expected_names):
                 print(f"[{run_idx}/{total_runs}] {base_name}: all checkpoints already present, skip", flush=True)
+                runs_pbar.update(1)
                 continue
 
             config = GPT2Config(
@@ -189,6 +192,8 @@ def main() -> None:
             checkpoint_ptr = 0
             print(f"[{run_idx}/{total_runs}] {base_name}: training {max_steps} steps", flush=True)
             model.train()
+            steps_pbar = tqdm(total=max_steps, desc=base_name, leave=False, unit="step")
+            last_ckpt_msg = "-"
             for step in range(1, max_steps + 1):
                 lr_now = float(lr_at_step(step))
                 for pg in optim.param_groups:
@@ -253,6 +258,7 @@ def main() -> None:
                     out_rows.append(row)
                     existing_run_names.add(run_name)
                     write_results_csv(out_rows, out_path)
+                    last_ckpt_msg = f"T{ckpt_tokens} L={val_loss:.3f} mu={mu if np.isfinite(mu) else float('nan'):.3g}"
                     print(
                         f"[{run_idx}/{total_runs}] {run_name}: val_loss={val_loss:.4f}, "
                         f"mu={mu if np.isfinite(mu) else float('nan'):.6g}",
@@ -265,12 +271,17 @@ def main() -> None:
                         f"train_loss={float(loss.item()):.4f}, lr={lr_now:.2e}",
                         flush=True,
                     )
+                steps_pbar.set_postfix(loss=f"{float(loss.item()):.4f}", lr=f"{lr_now:.2e}", ckpt=last_ckpt_msg)
+                steps_pbar.update(1)
+            steps_pbar.close()
+            runs_pbar.update(1)
 
         del train_stream, val_stream
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     print(f"Saved {len(out_rows)} rows to {out_path}", flush=True)
+    runs_pbar.close()
 
 
 if __name__ == "__main__":
