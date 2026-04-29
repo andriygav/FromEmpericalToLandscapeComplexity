@@ -94,6 +94,9 @@ def main() -> None:
     parser.add_argument("--min-checkpoint-tokens", type=int, default=20_000)
     parser.add_argument("--checkpoints", type=int, default=36)
     parser.add_argument("--mu-every", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--min-lr", type=float, default=3e-5)
+    parser.add_argument("--warmup-frac", type=float, default=0.03)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--out-csv", type=str, default="results_few_models.csv")
     args = parser.parse_args()
@@ -167,17 +170,30 @@ def main() -> None:
             )
             model = GPT2LMHeadModel(config).to(device)
             model.loss = lambda x, y: model(input_ids=x, labels=y).loss  # type: ignore[attr-defined]
-            optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+            optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
             train_iter = batch_iter_from_tokens(train_stream, 128, args.batch_size)
             tokens_per_step = 128 * args.batch_size
             max_steps = max(1, int(np.ceil(args.max_train_tokens / tokens_per_step)))
+            warmup_steps = max(1, int(round(args.warmup_frac * max_steps)))
             amp_enabled = use_amp and device.type == "cuda"
             scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+
+            def lr_at_step(step_idx: int) -> float:
+                # Kaplan-style schedule in practice: short warmup then smooth decay.
+                if step_idx <= warmup_steps:
+                    return args.lr * (step_idx / warmup_steps)
+                progress = (step_idx - warmup_steps) / max(1, max_steps - warmup_steps)
+                cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+                return args.min_lr + (args.lr - args.min_lr) * cosine
 
             checkpoint_ptr = 0
             print(f"[{run_idx}/{total_runs}] {base_name}: training {max_steps} steps", flush=True)
             model.train()
             for step in range(1, max_steps + 1):
+                lr_now = float(lr_at_step(step))
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_now
+
                 xb, yb = next(train_iter)
                 optim.zero_grad(set_to_none=True)
                 if amp_enabled:
@@ -245,7 +261,8 @@ def main() -> None:
 
                 if step == 1 or step % 500 == 0 or step == max_steps:
                     print(
-                        f"[{run_idx}/{total_runs}] {base_name}: step {step}/{max_steps}, train_loss={float(loss.item()):.4f}",
+                        f"[{run_idx}/{total_runs}] {base_name}: step {step}/{max_steps}, "
+                        f"train_loss={float(loss.item()):.4f}, lr={lr_now:.2e}",
                         flush=True,
                     )
 
