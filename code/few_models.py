@@ -52,22 +52,21 @@ class ModelSpec:
     n_embd: int
 
 
-def selected_six_models() -> List[ModelSpec]:
-    # Representative architectures used in dynamics plots.
+def selected_three_models() -> List[ModelSpec]:
+    # Minimal / middle / maximal representative architectures.
     return [
         ModelSpec("L2_H2_E48", 2, 2, 48),
-        ModelSpec("L3_H2_E64", 3, 2, 64),
-        ModelSpec("L4_H2_E80", 4, 2, 80),
         ModelSpec("L5_H2_E96", 5, 2, 96),
-        ModelSpec("L6_H4_E112", 6, 4, 112),
         ModelSpec("L7_H4_E128", 7, 4, 128),
     ]
 
 
-def build_tail_checkpoints(max_train_tokens: int) -> List[int]:
-    # Dense in the tail as requested.
-    base = [12_000_000, 16_000_000, 20_000_000, 25_000_000, 30_000_000, 36_000_000, 42_000_000, 50_000_000]
-    return [t for t in base if t <= max_train_tokens]
+def build_full_trajectory_checkpoints(max_train_tokens: int, n_points: int, min_tokens: int) -> List[int]:
+    vals = np.geomspace(min_tokens, max_train_tokens, num=max(8, n_points))
+    out = sorted({int(round(v / 1_000.0) * 1_000) for v in vals if v > 0})
+    if out[-1] != max_train_tokens:
+        out.append(int(max_train_tokens))
+    return sorted(set(out))
 
 
 def write_results_csv(rows: List[dict], path: Path) -> None:
@@ -91,10 +90,12 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seeds", type=int, default=8)
-    parser.add_argument("--max-train-tokens", type=int, default=50_000_000)
+    parser.add_argument("--max-train-tokens", type=int, default=100_000_000)
+    parser.add_argument("--min-checkpoint-tokens", type=int, default=20_000)
+    parser.add_argument("--checkpoints", type=int, default=36)
     parser.add_argument("--mu-every", type=int, default=1)
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--out-csv", type=str, default="results_tail_6models.csv")
+    parser.add_argument("--out-csv", type=str, default="results_few_models.csv")
     args = parser.parse_args()
 
     dataset_name = "wikitext"
@@ -108,11 +109,15 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    model_specs = selected_six_models()
+    model_specs = selected_three_models()
     seeds = list(range(max(1, args.seeds)))
-    checkpoints = build_tail_checkpoints(args.max_train_tokens)
+    checkpoints = build_full_trajectory_checkpoints(
+        max_train_tokens=args.max_train_tokens,
+        n_points=args.checkpoints,
+        min_tokens=args.min_checkpoint_tokens,
+    )
     print(
-        f"Tail run: models={len(model_specs)}, seeds={len(seeds)}, "
+        f"Few-model run: models={len(model_specs)}, seeds={len(seeds)}, "
         f"max_train_tokens={args.max_train_tokens}, checkpoints/model={len(checkpoints)}, "
         f"total_rows={len(model_specs) * len(seeds) * len(checkpoints)}",
         flush=True,
@@ -143,7 +148,7 @@ def main() -> None:
 
         for spec in model_specs:
             run_idx += 1
-            base_name = f"tail_s{seed}_{spec.model_id}_B{args.batch_size}"
+            base_name = f"few_s{seed}_{spec.model_id}_B{args.batch_size}"
             expected_names = [f"{base_name}_T{t}" for t in checkpoints]
             if all(n in existing_run_names for n in expected_names):
                 print(f"[{run_idx}/{total_runs}] {base_name}: all checkpoints already present, skip", flush=True)
@@ -244,7 +249,6 @@ def main() -> None:
                         flush=True,
                     )
 
-        # Keep memory bounded: hold token streams only for one seed.
         del train_stream, val_stream
         if device.type == "cuda":
             torch.cuda.empty_cache()
