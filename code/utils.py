@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from tqdm import tqdm
 
 
 def configure_torch_cpu(num_threads: int | None = None) -> None:
@@ -93,7 +94,9 @@ def load_real_token_streams(
         batch_size = 512
 
         filtered = [t for t in texts if t and t.strip()]
-        for i in range(0, len(filtered), batch_size):
+        n_batches = (len(filtered) + batch_size - 1) // batch_size
+        pbar = tqdm(range(0, len(filtered), batch_size), total=n_batches, desc=f"tokenize<{budget}>", leave=False)
+        for i in pbar:
             batch = filtered[i : i + batch_size]
             enc = tok(
                 batch,
@@ -109,7 +112,11 @@ def load_real_token_streams(
                 chunks.append(t)
                 total += int(t.numel())
                 if total >= budget:
+                    pbar.set_postfix(tokens=total)
+                    pbar.close()
                     return torch.cat(chunks, dim=0)[:budget].to(device)
+            pbar.set_postfix(tokens=total)
+        pbar.close()
 
         if not chunks:
             return torch.empty(0, dtype=torch.long, device=device)
