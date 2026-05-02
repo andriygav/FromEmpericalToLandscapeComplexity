@@ -159,7 +159,13 @@ def landscape_complexity_mu(
     y: torch.Tensor,
     rank: int,
     n_examples: int,
+    probe_seed: int | None = None,
 ) -> float:
+    """Estimate per-example Hessian dispersion mu (spectral-norm proxy via random probes).
+
+    If ``probe_seed`` is set, random probe directions are drawn with a local ``Generator``,
+    isolating directional variance from batch sampling when the caller fixes ``x``, ``y``.
+    """
     n_examples = max(2, min(n_examples, x.shape[0]))
     n_probes = max(1, rank)
     x_probe = x[:n_examples]
@@ -167,9 +173,16 @@ def landscape_complexity_mu(
     params = [p for p in model.parameters() if p.requires_grad]
     numel = sum(p.numel() for p in params)
 
+    gen = torch.Generator()
+    if probe_seed is not None:
+        gen.manual_seed(int(probe_seed))
+
     probes: List[torch.Tensor] = []
     for _ in range(n_probes):
-        v = torch.randn(numel, device=x.device)
+        if probe_seed is not None:
+            v = torch.randn(numel, device=x.device, dtype=torch.float32, generator=gen)
+        else:
+            v = torch.randn(numel, device=x.device, dtype=torch.float32)
         v = v / (torch.linalg.norm(v) + 1e-12)
         probes.append(v)
 

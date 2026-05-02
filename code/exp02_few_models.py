@@ -54,7 +54,6 @@ class ModelSpec:
 
 
 def selected_three_models() -> List[ModelSpec]:
-    # Minimal / middle / maximal representative architectures.
     return [
         ModelSpec("L2_H2_E48", 2, 2, 48),
         ModelSpec("L5_H2_E96", 5, 2, 96),
@@ -171,7 +170,6 @@ def main() -> None:
             scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
             def lr_at_step(step_idx: int) -> float:
-                # Kaplan-style schedule in practice: short warmup then smooth decay.
                 if step_idx <= warmup_steps:
                     return args.lr * (step_idx / warmup_steps)
                 progress = (step_idx - warmup_steps) / max(1, max_steps - warmup_steps)

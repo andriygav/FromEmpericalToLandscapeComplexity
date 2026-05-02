@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=8)
     parser.add_argument("--max-train-tokens", type=int, default=12_000_000)
     parser.add_argument("--checkpoints", type=int, default=20)
-    parser.add_argument("--mu-every", type=int, default=1, help="Compute mu every K checkpoints.")
+    parser.add_argument("--mu-every", type=int, default=1)
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
 
@@ -165,8 +165,6 @@ def main() -> None:
                 attn_pdrop=0.0,
             )
             model = GPT2LMHeadModel(config).to(device)
-
-            # Keep compatibility with existing utilities expecting model.loss(x, y).
             model.loss = lambda x, y: model(input_ids=x, labels=y).loss  # type: ignore[attr-defined]
             optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
             train_iter = batch_iter_from_tokens(train_tokens_stream, 128, args.batch_size)
